@@ -7,6 +7,7 @@
 #include <functional>
 #include <map>
 #include <sdbus-c++/sdbus-c++.h>
+#include <semaphore>
 #include <thread>
 #include <vector>
 
@@ -21,11 +22,12 @@ int main() {
   const sdbus::ObjectPath devicePath{"/org/bluez/hci0/dev_00_11_22_33_44_55"};
   auto device = sdbus::createObject(*connection, devicePath);
   std::atomic<int> writes = 0;
-  std::atomic<bool> failWrites = false;
+  std::counting_semaphore<7> replies{0};
   auto delayedSetter = [&](bool) {
-    std::this_thread::sleep_for(200ms);
-    ++writes;
-    if (failWrites) {
+    const bool released = replies.try_acquire_for(10s);
+    assert(released && "Property dispatch waited for a withheld reply");
+    const int request = ++writes;
+    if (request == 5 || request == 7) {
       throw sdbus::Error(sdbus::Error::Name{"org.bluez.Error.Failed"}, "Test property failure");
     }
   };
@@ -55,13 +57,14 @@ int main() {
   };
   wait([&] { return service.hasStateSnapshot() && service.devices().size() == 1; });
 
-  // Each setter takes 200ms on the server. Dispatch must not wait for its reply.
-  const auto start = std::chrono::steady_clock::now();
+  // Replies stay withheld until all four setters have returned. The server timeout
+  // only guards against deadlock if a setter becomes synchronous again.
   service.setPowered(false);
   service.setDiscoverable(true);
   service.setPairable(false);
   service.setTrusted(devicePath, true);
-  assert(std::chrono::steady_clock::now() - start < 100ms);
+  assert(writes == 0);
+  replies.release(4);
   assert(service.state().powered);
   wait([&] { return writes == 4; });
 
@@ -85,21 +88,21 @@ int main() {
   assert(lastOrigin == BluetoothStateChangeOrigin::External);
 
   // An earlier failure must not clear a newer request for the same power state.
-  failWrites = true;
   const int beforeRepeatedRequest = stateChanges;
   service.setPowered(false);
   service.setPowered(false);
+  replies.release();
   wait([&] { return writes == 5 && stateChanges > beforeRepeatedRequest; });
-  failWrites = false;
+  replies.release();
   wait([&] { return writes == 6; });
   emitPowered(false);
   assert(lastOrigin == BluetoothStateChangeOrigin::Noctalia);
   emitPowered(true);
 
   // A failed local request must not mislabel the next external power change.
-  failWrites = true;
   const int previousChanges = stateChanges;
   service.setPowered(false);
+  replies.release();
   wait([&] { return writes == 7 && stateChanges > previousChanges; });
   assert(service.state().powered);
   emitPowered(false);
